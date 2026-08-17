@@ -71,14 +71,14 @@ def rotate_half(x):
     return torch.cat([-second, first], dim=-1)
 
 def apply_rope(q, k, cos, sin):
-    cos = cos.unsqueeze(0).unsqueeze(0)
-    sin = sin.unsqueeze(0).unsqueeze(0)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
     dtype = q.dtype
     q_out = (q*cos + rotate_half(q)*sin).to(dtype)
     k_out = (k*cos + rotate_half(k)*sin).to(dtype)
     return q_out, k_out
 
-def gqa_attention(x, weights, layer_idx, config, cos, sin, kvcache, start_pos, seq):
+def gqa_attention(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag):
     q_w = weights[f"model.layers.{layer_idx}.self_attn.q_proj.weight"]
     q_b = weights[f"model.layers.{layer_idx}.self_attn.q_proj.bias"]
     k_w = weights[f"model.layers.{layer_idx}.self_attn.k_proj.weight"]
@@ -104,12 +104,20 @@ def gqa_attention(x, weights, layer_idx, config, cos, sin, kvcache, start_pos, s
     # kvcache.v[layer_idx][:, :, start_pos : start_pos + seq_len] = v
     # k_out = kvcache.k[layer_idx][:, :, : start_pos + seq_len]
     # v = kvcache.v[layer_idx][:, :, : start_pos + seq_len]
-    kvcache.scatter(seq, layer_idx, k_out, v)
-    k_out, v = kvcache.gather(seq, layer_idx)
+
+    if prefillFlag:
+        kvcache.scatter_prefill(seq_list[0], layer_idx, k_out, v)
+        k_out, v = kvcache.gather_prefill(seq_list[0], layer_idx)
+    else:
+        kvcache.scatter_decode(seq_list, layer_idx, k_out, v)
+        k_out, v, attn_mask = kvcache.gather_decode(seq_list, layer_idx)
 
     k_out = torch.repeat_interleave(k_out, n_heads//n_kv_heads, dim=1)
     v = torch.repeat_interleave(v, n_heads//n_kv_heads, dim=1)
-    x = F.scaled_dot_product_attention(q_out, k_out, v, is_causal=start_pos==0)
+    if prefillFlag:
+        x = F.scaled_dot_product_attention(q_out, k_out, v, attn_mask=None, is_causal=True)
+    else:
+        x = F.scaled_dot_product_attention(q_out, k_out, v, attn_mask=attn_mask, is_causal=False)
     x = x.transpose(1, 2).reshape(batch_size, seq_len, config.hidden_size)
     return F.linear(x, o_w)
 
@@ -119,36 +127,53 @@ def swiglu(x, weights, layer_idx):
     d_w = weights[f"model.layers.{layer_idx}.mlp.down_proj.weight"]
     return F.linear(F.silu(F.linear(x, g_w)) * F.linear(x, u_w), d_w)
 
-def decoder_layer(x, weights, layer_idx, config, cos, sin, start_pos, seq_len, kvcache, seq):
+def decoder_layer(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag):
     input_layernorm_weight = weights[f"model.layers.{layer_idx}.input_layernorm.weight"]
     post_attention_layernorm_weight = weights[f"model.layers.{layer_idx}.post_attention_layernorm.weight"]
     eps = config.rms_norm_eps
-    sliced_cos = cos[start_pos : start_pos+seq_len]
-    sliced_sin = sin[start_pos : start_pos+seq_len]
-    h = x + gqa_attention(rmsnorm(x, input_layernorm_weight, eps), weights, layer_idx, config, sliced_cos, sliced_sin, kvcache, start_pos, seq)
+    h = x + gqa_attention(rmsnorm(x, input_layernorm_weight, eps), weights, layer_idx, config, cos, sin, kvcache, seq_list, prefillFlag)
     out = h + swiglu(rmsnorm(h, post_attention_layernorm_weight, eps), weights, layer_idx)
     return out
 
 @torch.inference_mode()
-def forward(token_ids, weights, config, cos, sin, kvcache, seq):
+def forward_prefill(token_ids, weights, config, cos, sin, kvcache, seq_list):
+    seq = seq_list[0]
     batch_size, seq_len = token_ids.shape
     kvcache.ensure_capacity(seq, seq_len)
     x = F.embedding(token_ids, weights["model.embed_tokens.weight"])
-    start_pos = seq.length
+    positions = torch.arange(seq.length, seq.length + seq_len, device=cos.device).unsqueeze(0)
+    cos_pos = cos[positions]
+    sin_pos = sin[positions]
     seq.length += seq_len
     for i in range(config.num_hidden_layers):
-        x = decoder_layer(x, weights, i, config, cos, sin, start_pos, seq_len, kvcache, seq)
+        x = decoder_layer(x, weights, i, config, cos_pos, sin_pos, kvcache, seq_list, True)
     x = rmsnorm(x, weights["model.norm.weight"], config.rms_norm_eps)
     return F.linear(x, weights["model.embed_tokens.weight"])
 
 @torch.inference_mode()
-def prefill(token_ids, weights, config, cos, sin, kvcache, seq):
-    resp = forward(token_ids, weights, config, cos, sin, kvcache, seq)
+def forward_decode(token_ids, weights, config, cos, sin, kvcache, seq_list):
+    batch_size, seq_len = token_ids.shape
+    for seq in seq_list:
+        kvcache.ensure_capacity(seq, seq_len)
+    x = F.embedding(token_ids, weights["model.embed_tokens.weight"])
+    for seq in seq_list:
+        seq.length += seq_len
+    positions = torch.tensor([[seq.length-1] for seq in seq_list], device=cos.device)
+    cos_pos = cos[positions]
+    sin_pos = sin[positions]
+    for i in range(config.num_hidden_layers):
+        x = decoder_layer(x, weights, i, config, cos_pos, sin_pos, kvcache, seq_list, False)
+    x = rmsnorm(x, weights["model.norm.weight"], config.rms_norm_eps)
+    return F.linear(x, weights["model.embed_tokens.weight"])
+
+@torch.inference_mode()
+def prefill(token_ids, weights, config, cos, sin, kvcache, seq_list):
+    resp = forward_prefill(token_ids, weights, config, cos, sin, kvcache, seq_list)
     return resp[:, -1]
 
 @torch.inference_mode()
-def decode(token_id, weights, config, cos, sin, kvcache, seq):
-    resp = forward(token_id, weights, config, cos, sin, kvcache, seq)
+def decode(token_id, weights, config, cos, sin, kvcache, seq_list):
+    resp = forward_decode(token_id, weights, config, cos, sin, kvcache, seq_list)
     return resp[:, -1]
 
 @torch.inference_mode()
@@ -163,12 +188,16 @@ def generate(prompt, max_new_tokens, tokenizer, weights, config, cos, sin, kvcac
     seq = Sequence()
 
     generated = []
-    logits = prefill(token_ids, weights, config, cos, sin, kvcache, seq)
+    logits = prefill(token_ids, weights, config, cos, sin, kvcache, [seq])
     last_token = logits.argmax(-1, keepdim=True)
     generated.append(last_token.item())
+    if last_token.item() == 151645:
+        for block_id in seq.block_table:
+            kvcache.free(block_id)
+        return generated
 
     for i in range(max_new_tokens-1):
-        logits = decode(last_token, weights, config, cos, sin, kvcache, seq)
+        logits = decode(last_token, weights, config, cos, sin, kvcache, [seq])
         last_token = logits.argmax(-1, keepdim=True)
         generated.append(last_token.item())
         if last_token.item() == 151645:
