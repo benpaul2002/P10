@@ -7,6 +7,7 @@ class KVCache:
     k: list[torch.Tensor] = field(default_factory=list)
     v: list[torch.Tensor] = field(default_factory=list)
     free_blocks: list[int] = field(default_factory=list)
+    reserved_blocks: int = 0
     block_size: int = 16
     num_blocks: int = 128
 
@@ -31,7 +32,11 @@ class KVCache:
         block_table = seq.block_table
         blocks_needed = ceil((seq.length + n_new_tokens) / self.block_size)
         while len(block_table) < blocks_needed:
-            block_table.append(self.allocate())
+            block_id = self.allocate()
+            block_table.append(block_id)
+            if seq.reserved_blocks>0:
+                self.reserved_blocks -= 1
+                seq.reserved_blocks -= 1
 
     def compute_blockId_offset(self, seq, start, end, device):
         positions = torch.arange(start, end, device=device)
@@ -89,8 +94,9 @@ class KVCache:
 
 @dataclass
 class Sequence:
-    block_table: list[int] = field(default_factory=list)
     length: int = 0
+    reserved_blocks: int = 0
+    block_table: list[int] = field(default_factory=list)
 
 if __name__ == "__main__":
     # Allocator invariants. Deliberately does not import model.py -- the pool

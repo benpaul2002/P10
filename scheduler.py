@@ -37,12 +37,15 @@ class Scheduler:
     running: list[Request] = field(default_factory=list)
     finished: list[Request] = field(default_factory=list)
 
+    def get_blocks_needed(self, request):
+        return ceil((len(request.prompt_ids) + request.max_new_tokens) / self.kvcache.block_size)
+
     def can_admit(self, request):
-        blocks_needed = ceil((len(request.prompt_ids) + request.max_new_tokens) / self.kvcache.block_size)
-        return blocks_needed <= len(self.kvcache.free_blocks)
+        blocks_needed = self.get_blocks_needed(request)
+        return blocks_needed <= len(self.kvcache.free_blocks)-self.kvcache.reserved_blocks
 
     def add_request(self, request):
-        blocks_needed = ceil((len(request.prompt_ids) + request.max_new_tokens) / self.kvcache.block_size)
+        blocks_needed = self.get_blocks_needed(request)
         if blocks_needed > self.kvcache.num_blocks:
             raise RuntimeError("Request prompt too big, cannot accomodate!")
         self.waiting_queue.append(request)
@@ -50,6 +53,8 @@ class Scheduler:
     def retire(self, req):
         for block_id in req.seq.block_table:
             self.kvcache.free(block_id)
+        self.kvcache.reserved_blocks -= req.seq.reserved_blocks
+        req.seq.reserved_blocks = 0
         req.seq.block_table.clear()
         req.seq.length = 0
         req.state = RequestState.DONE
@@ -64,6 +69,9 @@ class Scheduler:
         for req in list(self.waiting_queue):
             if self.can_admit(req):
                 self.waiting_queue.remove(req)
+                blocks_needed = self.get_blocks_needed(req)
+                req.seq.reserved_blocks = blocks_needed
+                self.kvcache.reserved_blocks += blocks_needed
                 logits = prefill(torch.tensor([req.prompt_ids], device=self.cos.device), self.weights, self.config, self.cos, self.sin, self.kvcache, [req.seq])
                 token = int(logits.argmax(-1))
                 req.output_ids.append(token)
@@ -82,6 +90,6 @@ class Scheduler:
             for req, token in zip(self.running, out):
                 req.output_ids.append(token)
             
-    def run(self, ):
+    def run(self):
         while len(self.waiting_queue)>0 or len(self.running)>0:
             self.schedule()
