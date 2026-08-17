@@ -22,6 +22,7 @@ class ModelConfig:
     rope_theta: float
     tie_word_embeddings: bool
     max_position_embeddings: int
+    eos_token_id: int
     head_dim: int
 
 def load_config(model_snapshot_path):
@@ -39,6 +40,7 @@ def load_config(model_snapshot_path):
         model_config_full['rope_theta'],
         model_config_full['tie_word_embeddings'],
         model_config_full['max_position_embeddings'],
+        model_config_full['eos_token_id'],
         model_config_full['hidden_size'] // model_config_full['num_attention_heads']
     )
 
@@ -191,7 +193,7 @@ def generate(prompt, max_new_tokens, tokenizer, weights, config, cos, sin, kvcac
     logits = prefill(token_ids, weights, config, cos, sin, kvcache, [seq])
     last_token = logits.argmax(-1, keepdim=True)
     generated.append(last_token.item())
-    if last_token.item() == 151645:
+    if last_token.item() == config.eos_token_id:
         for block_id in seq.block_table:
             kvcache.free(block_id)
         return generated
@@ -200,7 +202,7 @@ def generate(prompt, max_new_tokens, tokenizer, weights, config, cos, sin, kvcac
         logits = decode(last_token, weights, config, cos, sin, kvcache, [seq])
         last_token = logits.argmax(-1, keepdim=True)
         generated.append(last_token.item())
-        if last_token.item() == 151645:
+        if last_token.item() == config.eos_token_id:
             break
 
     for block_id in seq.block_table:

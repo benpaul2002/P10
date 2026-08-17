@@ -91,7 +91,6 @@ class KVCache:
 class Sequence:
     block_table: list[int] = field(default_factory=list)
     length: int = 0
-        
 
 if __name__ == "__main__":
     # Allocator invariants. Deliberately does not import model.py -- the pool
