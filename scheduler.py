@@ -1,8 +1,7 @@
 from dataclasses import dataclass, field 
 import torch
-from cache import Sequence
 from enum import Enum
-from cache import KVCache
+from cache import KVCache, Sequence
 from model import ModelConfig, load_config, load_weights, prefill, decode
 from math import ceil
 

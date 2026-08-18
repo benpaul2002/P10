@@ -9,6 +9,7 @@ from cache import KVCache, Sequence
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 qwen0_5_snapshot_path = "/home/bnp24202/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775/"
+qwen1_5_snapshot_path = "/home/bnp24202/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306/"
 
 @dataclass
 class ModelConfig:
@@ -101,11 +102,6 @@ def gqa_attention(x, weights, layer_idx, config, cos, sin, kvcache, seq_list, pr
     k = k.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
     v = v.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
     q_out, k_out = apply_rope(q, k, cos, sin)
-
-    # kvcache.k[layer_idx][:, :, start_pos : start_pos + seq_len] = k_out
-    # kvcache.v[layer_idx][:, :, start_pos : start_pos + seq_len] = v
-    # k_out = kvcache.k[layer_idx][:, :, : start_pos + seq_len]
-    # v = kvcache.v[layer_idx][:, :, : start_pos + seq_len]
 
     if prefillFlag:
         kvcache.scatter_prefill(seq_list[0], layer_idx, k_out, v)

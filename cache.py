@@ -43,6 +43,14 @@ class KVCache:
         if self.refcounts[block_id] == 0:
             self.free_blocks.append(block_id)
 
+    def truncate(self, seq, new_length):
+        keep = ceil(new_length / self.block_size)
+        for block_id in seq.block_table[keep:]:
+            self.free(block_id)
+        seq.block_table = seq.block_table[:keep]
+        seq.length = new_length
+        seq.token_ids = seq.token_ids[:new_length]
+
     def incref(self, block_id):
         if block_id in self.free_blocks:
             self.free_blocks.remove(block_id)
