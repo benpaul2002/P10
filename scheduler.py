@@ -48,6 +48,7 @@ class Scheduler:
         blocks_needed = self.get_blocks_needed(request)
         if blocks_needed > self.kvcache.num_blocks:
             raise RuntimeError("Request prompt too big, cannot accomodate!")
+        request.seq.token_ids = list(request.prompt_ids)
         self.waiting_queue.append(request)
 
     def retire(self, req):
@@ -69,10 +70,12 @@ class Scheduler:
         for req in list(self.waiting_queue):
             if self.can_admit(req):
                 self.waiting_queue.remove(req)
-                blocks_needed = self.get_blocks_needed(req)
+                num_matched_blocks = self.kvcache.match_prefix(req.seq)
+                blocks_needed = self.get_blocks_needed(req) - num_matched_blocks
                 req.seq.reserved_blocks = blocks_needed
                 self.kvcache.reserved_blocks += blocks_needed
-                logits = prefill(torch.tensor([req.prompt_ids], device=self.cos.device), self.weights, self.config, self.cos, self.sin, self.kvcache, [req.seq])
+                logits = prefill(torch.tensor([req.prompt_ids[req.seq.length:]], device=self.cos.device), self.weights, self.config, self.cos, self.sin, self.kvcache, [req.seq])
+                self.kvcache.register(req.seq)
                 token = int(logits.argmax(-1))
                 req.output_ids.append(token)
                 if req.is_finished(self.config.eos_token_id):
@@ -89,6 +92,7 @@ class Scheduler:
             out = decode(token_ids, self.weights, self.config, self.cos, self.sin, self.kvcache, seq_list).argmax(-1).tolist()
             for req, token in zip(self.running, out):
                 req.output_ids.append(token)
+                req.seq.token_ids.append(token)
             
     def run(self):
         while len(self.waiting_queue)>0 or len(self.running)>0:
