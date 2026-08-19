@@ -53,8 +53,12 @@ def speculative_generate(prompt, max_new_tokens, tokenizer, draft_weights, draft
 
     generated = []
 
-    draft_logits = prefill(token_ids, draft_weights, draft_config, draft_cos, draft_sin, draft_kvcache, [draft_seq])
-    target_logits = prefill(token_ids, target_weights, target_config, target_cos, target_sin, target_kvcache, [target_seq])
+    draft_num_matched_blocks = draft_kvcache.match_prefix(draft_seq)
+    draft_logits = prefill(torch.tensor([draft_seq.token_ids[draft_seq.length:]], device=draft_cos.device), draft_weights, draft_config, draft_cos, draft_sin, draft_kvcache, [draft_seq])
+    draft_kvcache.register(draft_seq)
+    target_num_matched_blocks = target_kvcache.match_prefix(target_seq)
+    target_logits = prefill(torch.tensor([target_seq.token_ids[target_seq.length:]], device=target_cos.device), target_weights, target_config, target_cos, target_sin, target_kvcache, [target_seq])
+    target_kvcache.register(target_seq)
 
     temperature_t = torch.tensor([[temperature]], dtype=torch.float32, device=target_cos.device)
     top_p_t = torch.tensor([[top_p]], dtype=torch.float32, device=target_cos.device)
