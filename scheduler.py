@@ -36,15 +36,19 @@ class Scheduler:
     running: list[Request] = field(default_factory=list)
     finished: list[Request] = field(default_factory=list)
 
-    def get_blocks_needed(self, request):
-        return ceil((len(request.prompt_ids) + request.max_new_tokens) / self.kvcache.block_size)
-
     def can_admit(self, request):
-        blocks_needed = self.get_blocks_needed(request)
-        return blocks_needed <= len(self.kvcache.free_blocks)-self.kvcache.reserved_blocks
+        blocks_needed = ceil(len(request.prompt_ids + request.output_ids[:-1]) / self.kvcache.block_size)
+        return blocks_needed <= len(self.kvcache.free_blocks)
+
+    def get_num_new_blocks_needed_decode(self):
+        num_new_blocks_needed = 0
+        for req in self.running:
+            if req.seq.length % self.kvcache.block_size == 0:
+                num_new_blocks_needed += 1
+        return num_new_blocks_needed
 
     def add_request(self, request):
-        blocks_needed = self.get_blocks_needed(request)
+        blocks_needed = ceil((len(request.prompt_ids) + request.max_new_tokens) / self.kvcache.block_size)
         if blocks_needed > self.kvcache.num_blocks:
             raise RuntimeError("Request prompt too big, cannot accomodate!")
         request.seq.token_ids = list(request.prompt_ids)
@@ -53,12 +57,19 @@ class Scheduler:
     def retire(self, req):
         for block_id in req.seq.block_table:
             self.kvcache.free(block_id)
-        self.kvcache.reserved_blocks -= req.seq.reserved_blocks
-        req.seq.reserved_blocks = 0
         req.seq.block_table.clear()
         req.seq.length = 0
         req.state = RequestState.DONE
         self.finished.append(req)
+
+    def preempt(self, req):
+        for block_id in req.seq.block_table:
+            self.kvcache.free(block_id)
+        req.seq.block_table.clear()
+        req.seq.length = 0
+        req.state = RequestState.WAITING
+        self.running.remove(req)
+        self.waiting_queue.insert(0, req)
 
     def schedule(self):
         for req in self.running:
@@ -69,14 +80,13 @@ class Scheduler:
         for req in list(self.waiting_queue):
             if self.can_admit(req):
                 self.waiting_queue.remove(req)
+                req.seq.token_ids = req.prompt_ids + req.output_ids[:-1]
                 num_matched_blocks = self.kvcache.match_prefix(req.seq)
-                blocks_needed = self.get_blocks_needed(req) - num_matched_blocks
-                req.seq.reserved_blocks = blocks_needed
-                self.kvcache.reserved_blocks += blocks_needed
-                logits = prefill(torch.tensor([req.prompt_ids[req.seq.length:]], device=self.cos.device), self.weights, self.config, self.cos, self.sin, self.kvcache, [req.seq])
+                logits = prefill(torch.tensor([req.seq.token_ids[req.seq.length:]], device=self.cos.device), self.weights, self.config, self.cos, self.sin, self.kvcache, [req.seq])
                 self.kvcache.register(req.seq)
                 token = int(logits.argmax(-1))
-                req.output_ids.append(token)
+                if len(req.output_ids) == 0:
+                    req.output_ids.append(token)
                 if req.is_finished(self.config.eos_token_id):
                     self.retire(req)  
                 else:
@@ -85,13 +95,18 @@ class Scheduler:
             else:
                 break
 
+        num_new_blocks_needed = self.get_num_new_blocks_needed_decode()
+        while self.running and num_new_blocks_needed > len(self.kvcache.free_blocks):
+            self.preempt(self.running[-1])
+            num_new_blocks_needed = self.get_num_new_blocks_needed_decode()
         if len(self.running)>0:
             seq_list = [req.seq for req in self.running]
             token_ids = torch.tensor([[req.next_token()] for req in self.running], device=self.cos.device)
+
             out = decode(token_ids, self.weights, self.config, self.cos, self.sin, self.kvcache, seq_list).argmax(-1).tolist()
             for req, token in zip(self.running, out):
+                req.seq.token_ids.append(req.next_token())
                 req.output_ids.append(token)
-                req.seq.token_ids.append(token)
             
     def run(self):
         while len(self.waiting_queue)>0 or len(self.running)>0:

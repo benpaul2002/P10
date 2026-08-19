@@ -10,7 +10,6 @@ class KVCache:
     refcounts: list[int] = field(default_factory=list)
     registry: dict[int, tuple] = field(default_factory=dict)
     block_hashes: list[int | None] = field(default_factory=list)
-    reserved_blocks: int = 0
     block_size: int = 16
     num_blocks: int = 128
 
@@ -94,9 +93,6 @@ class KVCache:
         while len(block_table) < blocks_needed:
             block_id = self.allocate()
             block_table.append(block_id)
-            if seq.reserved_blocks>0:
-                self.reserved_blocks -= 1
-                seq.reserved_blocks -= 1
 
     def compute_blockId_offset(self, seq, start, end, device):
         positions = torch.arange(start, end, device=device)
@@ -155,7 +151,6 @@ class KVCache:
 @dataclass
 class Sequence:
     length: int = 0
-    reserved_blocks: int = 0
     block_table: list[int] = field(default_factory=list)
     token_ids: list[int] = field(default_factory=list)
 
