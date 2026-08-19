@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 import torch
 from enum import Enum
 from cache import KVCache, Sequence
-from model import ModelConfig, load_config, load_weights, prefill, decode
+from model import ModelConfig, load_config, load_weights, prefill, decode, sample
 from math import ceil
 
 class RequestState(str, Enum):
@@ -18,6 +18,8 @@ class Request:
     state: RequestState = RequestState.WAITING
     prompt_ids: list[int] = field(default_factory=list)
     output_ids: list[int] = field(default_factory=list)
+    temperature: int = 0
+    top_p: float = 1.0
 
     def next_token(self):
         return self.output_ids[-1]
@@ -84,7 +86,7 @@ class Scheduler:
                 num_matched_blocks = self.kvcache.match_prefix(req.seq)
                 logits = prefill(torch.tensor([req.seq.token_ids[req.seq.length:]], device=self.cos.device), self.weights, self.config, self.cos, self.sin, self.kvcache, [req.seq])
                 self.kvcache.register(req.seq)
-                token = int(logits.argmax(-1))
+                token = int(sample(logits, torch.tensor([[req.temperature]], dtype=torch.float32, device=self.cos.device), torch.tensor([[req.top_p]], dtype=torch.float32, device=self.cos.device)))
                 if len(req.output_ids) == 0:
                     req.output_ids.append(token)
                 if req.is_finished(self.config.eos_token_id):
@@ -102,9 +104,12 @@ class Scheduler:
         if len(self.running)>0:
             seq_list = [req.seq for req in self.running]
             token_ids = torch.tensor([[req.next_token()] for req in self.running], device=self.cos.device)
-
-            out = decode(token_ids, self.weights, self.config, self.cos, self.sin, self.kvcache, seq_list).argmax(-1).tolist()
-            for req, token in zip(self.running, out):
+            # out = decode(token_ids, self.weights, self.config, self.cos, self.sin, self.kvcache, seq_list).argmax(-1).tolist()
+            temperatures = torch.tensor([[req.temperature] for req in self.running], dtype=torch.float32, device=self.cos.device)
+            top_ps = torch.tensor([[req.top_p] for req in self.running], dtype=torch.float32, device=self.cos.device)
+            out = decode(token_ids, self.weights, self.config, self.cos, self.sin, self.kvcache, seq_list)
+            sampled = sample(out, temperatures, top_ps).tolist()
+            for req, token in zip(self.running, sampled):
                 req.seq.token_ids.append(req.next_token())
                 req.output_ids.append(token)
             

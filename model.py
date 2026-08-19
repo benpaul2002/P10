@@ -177,8 +177,28 @@ def decode(token_id, weights, config, cos, sin, kvcache, seq_list):
     resp = forward_decode(token_id, weights, config, cos, sin, kvcache, seq_list)
     return resp[:, -1]
 
+def probs_from_logits(logits, temperature, top_p):
+    temperature = temperature.clamp(min=1e-5)
+    logits = logits.to(torch.float32)
+    logits = logits / temperature
+    probs = torch.softmax(logits, dim=-1)
+    sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+    mask = sorted_probs.cumsum(dim=-1) - sorted_probs >= top_p
+    sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+    probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
+    probs = probs / probs.sum(-1, keepdim=True)
+    return probs
+
+def sample_from_probs(probs):
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+def sample(logits, temperature, top_p):
+    probs = probs_from_logits(logits, temperature, top_p)
+    sampled = sample_from_probs(probs)
+    return torch.where(temperature.squeeze(-1) == 0, logits.argmax(-1), sampled)
+
 @torch.inference_mode()
-def generate(prompt, max_new_tokens, tokenizer, weights, config, cos, sin, kvcache):
+def generate(prompt, max_new_tokens, tokenizer, weights, config, cos, sin, kvcache, temperature=0, top_p=1.0):
     text = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         tokenize=False,
@@ -190,7 +210,9 @@ def generate(prompt, max_new_tokens, tokenizer, weights, config, cos, sin, kvcac
 
     generated = []
     logits = prefill(token_ids, weights, config, cos, sin, kvcache, [seq])
-    last_token = logits.argmax(-1, keepdim=True)
+    temperature_t = torch.tensor([[temperature]], dtype=torch.float32, device=device)
+    top_p_t = torch.tensor([[top_p]], dtype=torch.float32, device=device)
+    last_token = sample(logits, temperature_t, top_p_t).view(1, 1)
     generated.append(last_token.item())
     if last_token.item() == config.eos_token_id:
         for block_id in seq.block_table:
@@ -199,7 +221,7 @@ def generate(prompt, max_new_tokens, tokenizer, weights, config, cos, sin, kvcac
 
     for i in range(max_new_tokens-1):
         logits = decode(last_token, weights, config, cos, sin, kvcache, [seq])
-        last_token = logits.argmax(-1, keepdim=True)
+        last_token = sample(logits, temperature_t, top_p_t).view(1, 1)
         generated.append(last_token.item())
         if last_token.item() == config.eos_token_id:
             break
