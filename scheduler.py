@@ -39,8 +39,9 @@ class Scheduler:
     finished: list[Request] = field(default_factory=list)
 
     def can_admit(self, request):
-        blocks_needed = ceil(len(request.prompt_ids + request.output_ids[:-1]) / self.kvcache.block_size)
-        return blocks_needed <= len(self.kvcache.free_blocks)
+        total = ceil(len(request.seq.token_ids) / self.kvcache.block_size)
+        num_matched, num_to_revive = self.kvcache.probe_prefix(request.seq)
+        return total - num_matched + num_to_revive <= len(self.kvcache.free_blocks)
 
     def get_num_new_blocks_needed_decode(self):
         num_new_blocks_needed = 0
@@ -80,9 +81,9 @@ class Scheduler:
         self.running = [req for req in self.running if not req.is_finished(self.config.eos_token_id)]
 
         for req in list(self.waiting_queue):
+            req.seq.token_ids = req.prompt_ids + req.output_ids[:-1]
             if self.can_admit(req):
                 self.waiting_queue.remove(req)
-                req.seq.token_ids = req.prompt_ids + req.output_ids[:-1]
                 num_matched_blocks = self.kvcache.match_prefix(req.seq)
                 logits = prefill(torch.tensor([req.seq.token_ids[req.seq.length:]], device=self.cos.device), self.weights, self.config, self.cos, self.sin, self.kvcache, [req.seq])
                 self.kvcache.register(req.seq)
