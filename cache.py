@@ -44,11 +44,16 @@ class KVCache:
 
     def truncate(self, seq, new_length):
         keep = ceil(new_length / self.block_size)
+        seq.num_registered = min(seq.num_registered, new_length // self.block_size)
         for block_id in seq.block_table[keep:]:
             self.free(block_id)
         seq.block_table = seq.block_table[:keep]
         seq.length = new_length
         seq.token_ids = seq.token_ids[:new_length]
+        h = None
+        for i in range(seq.num_registered):
+            h = self.block_hash(tuple(seq.token_ids[i*self.block_size:(i+1)*self.block_size]), h)
+        seq.prefix_hash = h
 
     def incref(self, block_id):
         if block_id in self.free_blocks:
@@ -59,8 +64,8 @@ class KVCache:
         return hash((prev_hash, tuple(token_ids)))
 
     def register(self, seq):
-        prev_hash = None
-        for i in range(seq.length // self.block_size):
+        prev_hash = seq.prefix_hash
+        for i in range(seq.num_registered, seq.length // self.block_size):
             start = i * self.block_size
             end = (i+1) * self.block_size
             chunk = tuple(seq.token_ids[start:end])
@@ -69,6 +74,8 @@ class KVCache:
                 self.registry[h] = (seq.block_table[i], chunk)
                 self.block_hashes[seq.block_table[i]] = h
             prev_hash = h
+        seq.num_registered = seq.length // self.block_size
+        seq.prefix_hash = prev_hash
 
     def match_prefix(self, seq):
         matched = []
@@ -85,6 +92,8 @@ class KVCache:
             prev_hash = h
         seq.block_table = matched
         seq.length = len(matched) * self.block_size
+        seq.num_registered = len(matched)
+        seq.prefix_hash = prev_hash
         return len(matched)
 
     def ensure_capacity(self, seq, n_new_tokens):
@@ -153,6 +162,8 @@ class Sequence:
     length: int = 0
     block_table: list[int] = field(default_factory=list)
     token_ids: list[int] = field(default_factory=list)
+    num_registered: int = 0
+    prefix_hash: int | None = None
 
 if __name__ == "__main__":
     # Allocator invariants. Deliberately does not import model.py -- the pool

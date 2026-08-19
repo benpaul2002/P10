@@ -112,6 +112,7 @@ class Scheduler:
             for req, token in zip(self.running, sampled):
                 req.seq.token_ids.append(req.next_token())
                 req.output_ids.append(token)
+                self.kvcache.register(req.seq)
             
     def run(self):
         while len(self.waiting_queue)>0 or len(self.running)>0:
