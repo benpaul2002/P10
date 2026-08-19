@@ -1,18 +1,21 @@
 import torch
 from cache import KVCache, Sequence
-from model import ModelConfig, load_config, load_weights, forward_prefill, prefill, decode
+from model import ModelConfig, load_config, load_weights, forward_prefill, prefill, decode, probs_from_logits, sample_from_probs, sample
 
-def draft_tokens(weights, config, cos, sin, kvcache, seq, last_token, k):
+def draft_tokens(weights, config, cos, sin, kvcache, seq, last_token, k, temperature, top_p):
     proposed = []
     last_token = torch.tensor([[last_token]], device=cos.device)
+    q_rows = []
     for i in range(k):
         seq.token_ids.append(last_token.item())
         logits = decode(last_token, weights, config, cos, sin, kvcache, [seq])
-        last_token = logits.argmax(-1, keepdim=True)
+        probs = probs_from_logits(logits, temperature, top_p)
+        q_rows.append(probs)
+        last_token = sample_from_probs(probs).view(1, 1)
         proposed.append(last_token.item())
         if last_token.item() == config.eos_token_id:
             break
-    return proposed
+    return proposed, torch.cat(q_rows, dim=0)
 
 def target_tokens(weights, config, cos, sin, kvcache, seq, last_token, proposed):
     window = [last_token] + proposed
@@ -20,14 +23,23 @@ def target_tokens(weights, config, cos, sin, kvcache, seq, last_token, proposed)
     seq.token_ids.extend(window)
     return forward_prefill(token_ids, weights, config, cos, sin, kvcache, [seq])
 
-def accept_proposal(logits, proposal):
-    preds = logits.argmax(-1)[0].tolist()
+def accept_proposal(logits, proposal, q, temperature, top_p):
+    # preds = logits.argmax(-1)[0].tolist()
+    p = probs_from_logits(logits, temperature, top_p).squeeze(0)
     for i in range(len(proposal)):
-        if preds[i] != proposal[i]:
-            return proposal[:i] + [preds[i]], i
-    return proposal + [preds[len(proposal)]], len(proposal)
+        # if preds[i] != proposal[i]:
+        #     return proposal[:i] + [preds[i]], i
+        t = proposal[i]
+        r = torch.rand(())
+        if r >= (p[i, t]/q[i, t]):
+            residual = (p[i] - q[i]).clamp(min=0)
+            residual = residual / residual.sum().clamp(min=1e-10)
+            sampled = int(sample_from_probs(residual))
+            return proposal[:i] + [sampled], i
+    sampled = int(sample_from_probs(p[len(proposal)]))
+    return proposal + [sampled], len(proposal)
 
-def speculative_generate(prompt, max_new_tokens, tokenizer, draft_weights, draft_config, draft_cos, draft_sin, target_weights, target_config, target_cos, target_sin, draft_kvcache, target_kvcache, k):
+def speculative_generate(prompt, max_new_tokens, tokenizer, draft_weights, draft_config, draft_cos, draft_sin, target_weights, target_config, target_cos, target_sin, draft_kvcache, target_kvcache, k, temperature=0, top_p=1.0):
     text = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         tokenize=False,
@@ -43,8 +55,11 @@ def speculative_generate(prompt, max_new_tokens, tokenizer, draft_weights, draft
 
     draft_logits = prefill(token_ids, draft_weights, draft_config, draft_cos, draft_sin, draft_kvcache, [draft_seq])
     target_logits = prefill(token_ids, target_weights, target_config, target_cos, target_sin, target_kvcache, [target_seq])
+
+    temperature_t = torch.tensor([[temperature]], dtype=torch.float32, device=target_cos.device)
+    top_p_t = torch.tensor([[top_p]], dtype=torch.float32, device=target_cos.device)
     
-    last_token = int(target_logits.argmax(-1))
+    last_token = int(sample(target_logits, temperature_t, top_p_t))
     generated.append(last_token)
     if last_token == target_config.eos_token_id:
         for block_id in draft_seq.block_table:
@@ -54,9 +69,9 @@ def speculative_generate(prompt, max_new_tokens, tokenizer, draft_weights, draft
         return generated
 
     while len(generated) < max_new_tokens:
-        proposed = draft_tokens(draft_weights, draft_config, draft_cos, draft_sin, draft_kvcache, draft_seq, last_token, k)
+        proposed, q = draft_tokens(draft_weights, draft_config, draft_cos, draft_sin, draft_kvcache, draft_seq, last_token, k, temperature_t, top_p_t)
         logits = target_tokens(target_weights, target_config, target_cos, target_sin, target_kvcache, target_seq, last_token, proposed)
-        emitted, num_accepted = accept_proposal(logits, proposed)
+        emitted, num_accepted = accept_proposal(logits, proposed, q, temperature_t, top_p_t)
         L = target_seq.length - (len(proposed) - num_accepted)
         target_kvcache.truncate(target_seq, L)
         if draft_seq.length > L:
