@@ -18,7 +18,7 @@ bench.py      wall-clock benchmarks (TTFT, inter-token latency, throughput)
 
 ## Numbers
 
-**KV cache** 1
+**KV cache**
 
 6-token blocks, 128-block pool. GQA makes it far smaller than MHA would: the 1.5B shares 12 query heads across 2 KV heads, so 6x less cache. 28 KB/token on the 1.5B, 12 KB/token on the 0.5B.
 
@@ -68,4 +68,5 @@ A batch-8 decode step costs only 1.4x a batch-1 step but serves 8 sequences, so 
 **Speculative decoding** 
 
 Used the smaller (0.5B) model as a draft model for the target (1.5B) model. Draft model produces k=4 proposal tokens, target model goes through all k at once and greedily picks all that match. Ran three prompts - 56 tokens from 19 target passes (2.95x fewer than one pass per token). Acceptance rate of 0.52. Output is token-identical to the target decoding alone.
+
 However, it's slower - 0.81x, 0.80x, 1.20x on those three prompts. This is because at batch 1, cost is dominated by launch overhead rather than FLOPs. A larger target would show a speedup, however this isn't possible here due to memory constraints.
