@@ -20,6 +20,7 @@ class Request:
     output_ids: list[int] = field(default_factory=list)
     temperature: int = 0
     top_p: float = 1.0
+    skips: int = 0
 
     def next_token(self):
         return self.output_ids[-1]
@@ -36,6 +37,8 @@ class SchedulerStats:
     tokens_decoded: int = 0
     prefill_tokens: int = 0
     prefill_tokens_cached: int = 0
+    skipped: int = 0
+    barriers: int = 0
 
     @property
     def mean_batch_size(self):
@@ -49,7 +52,8 @@ class SchedulerStats:
             f"decode steps         {self.decode_steps}\n"
             f"tokens decoded       {self.tokens_decoded}\n"
             f"mean batch size      {self.mean_batch_size:.2f}\n"
-            f"prefill tokens       {self.prefill_tokens} ({self.prefill_tokens_cached} served from cache, {pct:.1f}%)"
+            f"prefill tokens       {self.prefill_tokens} ({self.prefill_tokens_cached} served from cache, {pct:.1f}%)\n"
+            f"admissions skipped   {self.skipped} ({self.barriers} hit the skip cap and blocked the queue)"
         )
 
 @dataclass
@@ -63,6 +67,7 @@ class Scheduler:
     running: list[Request] = field(default_factory=list)
     finished: list[Request] = field(default_factory=list)
     stats: SchedulerStats = field(default_factory=SchedulerStats)
+    max_skips: int = 3
 
     def can_admit(self, request):
         total = ceil(len(request.seq.token_ids) / self.kvcache.block_size)
@@ -111,6 +116,7 @@ class Scheduler:
         for req in list(self.waiting_queue):
             req.seq.token_ids = req.prompt_ids + req.output_ids[:-1]
             if self.can_admit(req):
+                req.skips = 0
                 self.waiting_queue.remove(req)
                 self.kvcache.match_prefix(req.seq)
                 # After match_prefix, seq.length is exactly the prefix served
@@ -129,7 +135,11 @@ class Scheduler:
                     self.running.append(req)
                     req.state = RequestState.RUNNING
             else:
-                break
+                req.skips += 1
+                self.stats.skipped += 1
+                if req.skips >= self.max_skips:
+                    self.stats.barriers += 1
+                    break
 
         num_new_blocks_needed = self.get_num_new_blocks_needed_decode()
         while self.running and num_new_blocks_needed > len(self.kvcache.free_blocks):
