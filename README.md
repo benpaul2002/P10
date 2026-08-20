@@ -34,4 +34,6 @@ Decisive mismatches: A position is *decisive* if fp32's top two logits are more 
 | strict FIFO | 34 | 1.65 |
 | scan past | 25 | 2.24 |
 
-**Speculative decoding**, k=4, greedy, 0.5B drafting for the 1.5B: 56 tokens in 19 target passes (**2.95x fewer target forward passes**, not wall clock - each round also costs 4 draft passes), acceptance rate 0.52. Output is token-identical to the target decoding alone. Both models plus both pools fit in 4056 MB of 7808 MB.
+**Preemption.** Admission is optimistic - a request is admitted on the blocks it needs now, not on its worst case for its whole life - so the pool can run dry mid-flight. Decode then preempts the newest running request and rebuilds its KV from `prompt_ids + output_ids[:-1]` on readmission. 5 requests, 9-block pool: 3 preemptions, peak batch 4 over 52 steps, every block returned, output unchanged.
+
+**Speculative decoding**, k=4, greedy, 0.5B drafting for the 1.5B: 56 tokens in 19 target passes (**2.95x fewer target forward passes**), acceptance rate 0.52. Output is token-identical to the target decoding alone. Both models plus both pools fit in 4056 MB of 7808 MB.
