@@ -1,4 +1,4 @@
-# P10 - an LLM inference engine from scratch
+# llm-engine
 
 An inference engine for Qwen2.5, written in PyTorch.
 Implements a paged KV cache with prefix caching, continuous batching, and speculative decoding. 
