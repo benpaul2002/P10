@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field 
+from dataclasses import dataclass, field
 import torch
 from enum import Enum
 from cache import KVCache, Sequence
@@ -119,8 +119,6 @@ class Scheduler:
                 req.skips = 0
                 self.waiting_queue.remove(req)
                 self.kvcache.match_prefix(req.seq)
-                # After match_prefix, seq.length is exactly the prefix served
-                # from cache; the rest is what this prefill actually computes.
                 self.stats.admitted += 1
                 self.stats.prefill_tokens += len(req.seq.token_ids)
                 self.stats.prefill_tokens_cached += req.seq.length
@@ -148,7 +146,6 @@ class Scheduler:
         if len(self.running)>0:
             seq_list = [req.seq for req in self.running]
             token_ids = torch.tensor([[req.next_token()] for req in self.running], device=self.cos.device)
-            # out = decode(token_ids, self.weights, self.config, self.cos, self.sin, self.kvcache, seq_list).argmax(-1).tolist()
             temperatures = torch.tensor([[req.temperature] for req in self.running], dtype=torch.float32, device=self.cos.device)
             top_ps = torch.tensor([[req.top_p] for req in self.running], dtype=torch.float32, device=self.cos.device)
             self.stats.decode_steps += 1

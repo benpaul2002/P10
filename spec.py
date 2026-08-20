@@ -49,11 +49,8 @@ def target_tokens(weights, config, cos, sin, kvcache, seq, last_token, proposed)
     return forward_prefill(token_ids, weights, config, cos, sin, kvcache, [seq])
 
 def accept_proposal(logits, proposal, q, temperature, top_p):
-    # preds = logits.argmax(-1)[0].tolist()
     p = probs_from_logits(logits, temperature, top_p).squeeze(0)
     for i in range(len(proposal)):
-        # if preds[i] != proposal[i]:
-        #     return proposal[:i] + [preds[i]], i
         t = proposal[i]
         r = torch.rand(())
         if r >= (p[i, t]/q[i, t]):

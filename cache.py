@@ -16,9 +16,8 @@ class DecodePlan:
 class CacheStats:
     """Counters for the block pool.
 
-    blocks_matched counts every block a prefix lookup reused; blocks_revived is
-    the subset of those that had refcount 0 and had to be pulled back off the
-    free list. The difference is the sharing that was already live.
+    blocks_matched counts every block a prefix lookup reused. blocks_revived is
+    the subset that sat at refcount 0 and had to come back off the free list.
     """
     blocks_allocated: int = 0
     blocks_matched: int = 0
@@ -97,10 +96,6 @@ class KVCache:
         seq.prefix_hash = h
 
     def incref(self, block_id):
-        # Only reachable from match_prefix, so every call here is one block of
-        # prefix reuse. A block sitting at refcount 0 is on the free list and is
-        # being pulled back out -- that is a revival, and it consumes pool
-        # capacity that admission had to account for.
         if self.refcounts[block_id] == 0:
             self.free_blocks.remove(block_id)
             self.stats.blocks_revived += 1
@@ -109,9 +104,6 @@ class KVCache:
         self._note_usage()
 
     def _note_usage(self):
-        # Derived from the counters rather than the free list, because the pool
-        # is not always handed a full free list (tests constrain it), and
-        # num_blocks would then overstate what was ever available.
         s = self.stats
         in_use = s.blocks_allocated + s.blocks_revived - s.blocks_freed
         if in_use > s.peak_blocks_in_use:
