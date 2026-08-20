@@ -1677,14 +1677,20 @@ def check_prefix_caching_across_turns(snapshot_path, engine, device):
 
 
 def check_head_of_line_blocking(snapshot_path, engine, device):
-    """Skipping past a request that does not fit must not change what it says.
+    """Skipping past a request that does not fit must raise the batch size.
 
     The admission loop passes over a request whose blocks are unavailable and
-    tries the ones behind it. That is a scheduling change, so the thing to
-    prove is that it is invisible in the output.
+    tries the ones behind it, so the gap it leaves gets filled.
 
-    The second half is the starvation bound. Skipping is capped, so a request
-    passed over max_skips times becomes a barrier and still gets in.
+    The workload has to keep the pool contended or this measures nothing. That
+    needs prompts whose answers run long: with short answers every request
+    retires within a few tokens, blocks free up immediately, and the blocked
+    request gets in under either policy -- both then tie exactly.
+
+    Tokens are not compared across the two policies. The batch composition
+    differs, which changes the reduction order, which flips near-ties (section
+    6). What is asserted instead is that every request finishes for a
+    legitimate reason and none is starved.
     """
     tokenizer = AutoTokenizer.from_pretrained(snapshot_path)
 
@@ -1696,7 +1702,16 @@ def check_head_of_line_blocking(snapshot_path, engine, device):
         "fastest to slowest and say which one the KV cache normally lives in "
         "and why."
     )
-    short_prompts = ["What is 2+2?", "Name a colour.", "Say hello.", "Name a prime."]
+    # Long answers on purpose -- these must still be running when the long
+    # prompt is considered, or there is no contention to schedule around.
+    short_prompts = [
+        "Describe the water cycle step by step.",
+        "Explain what a cache is, in detail.",
+        "List ten prime numbers with reasons.",
+        "Explain recursion with an example.",
+        "Describe how a hard drive works.",
+    ]
+    BUDGET = 96
 
     def run(max_skips, n_blocks):
         kvcache, scheduler = _build_scheduler(engine, device, n_blocks=n_blocks)
@@ -1704,35 +1719,38 @@ def check_head_of_line_blocking(snapshot_path, engine, device):
         # Order matters: the long prompt must arrive behind some short ones,
         # so the pool is already partly held when it is considered. First in
         # the queue it would take an empty pool and block nobody.
-        _submit(scheduler, tokenizer, short_prompts[0], 16, 1)
-        _submit(scheduler, tokenizer, short_prompts[1], 16, 2)
-        _submit(scheduler, tokenizer, long_prompt, 16, 0)
-        _submit(scheduler, tokenizer, short_prompts[2], 16, 3)
-        _submit(scheduler, tokenizer, short_prompts[3], 16, 4)
+        _submit(scheduler, tokenizer, short_prompts[0], BUDGET, 1)
+        _submit(scheduler, tokenizer, short_prompts[1], BUDGET, 2)
+        _submit(scheduler, tokenizer, long_prompt, BUDGET, 0)
+        for j, prompt in enumerate(short_prompts[2:]):
+            _submit(scheduler, tokenizer, prompt, BUDGET, j + 3)
         scheduler.run()
         outputs = {r.request_id: list(r.output_ids) for r in scheduler.finished}
         order = [r.request_id for r in scheduler.finished]
         return kvcache, scheduler, outputs, order
 
-    # 10 blocks: the two leading short requests hold enough of the pool that
-    # the 7-block long prompt cannot be admitted, but the two behind it can.
-    n_blocks = 10
+    # 20 blocks: the leading requests hold enough that the long prompt cannot
+    # be admitted, while the ones behind it still fit.
+    n_blocks = 20
     fifo_kv, fifo, fifo_out, fifo_order = run(0, n_blocks)
     aged_kv, aged, aged_out, aged_order = run(3, n_blocks)
 
     n_requests = 1 + len(short_prompts)
+    eos = engine[0].eos_token_id
     for st, name in ((fifo.stats, "fifo"), (aged.stats, "aged")):
         assert st.retired == n_requests, (
             f"{name}: {st.retired} of {n_requests} requests retired -- the long "
             "request was starved or the queue deadlocked"
         )
 
-    # The core claim: admission order is not allowed to change the tokens.
-    for rid in sorted(fifo_out):
-        assert fifo_out[rid] == aged_out[rid], (
-            f"request {rid} produced different tokens under the two admission "
-            f"policies: {fifo_out[rid][:8]} vs {aged_out[rid][:8]}"
-        )
+    # Reordering admission may not drop or truncate anybody. Tokens are not
+    # compared -- see the docstring.
+    for outs, name in ((fifo_out, "fifo"), (aged_out, "aged")):
+        for rid, out in outs.items():
+            assert len(out) <= BUDGET, f"{name}: request {rid} overran its budget"
+            assert out[-1] == eos or len(out) == BUDGET, (
+                f"{name}: request {rid} stopped at {len(out)} tokens without EOS"
+            )
 
     # With max_skips=0 every skip breaks immediately, so the two counters must
     # coincide -- that is what "strict FIFO" means in terms of these counters.
@@ -1775,7 +1793,7 @@ def check_head_of_line_blocking(snapshot_path, engine, device):
     print(f"  skips                 {fifo.stats.skipped} fifo "
           f"({fifo.stats.barriers} barriers), {aged.stats.skipped} aged "
           f"({aged.stats.barriers} barriers)")
-    print(f"  output                identical for all {n_requests} requests")
+    print(f"  output                all {n_requests} requests ran to EOS or budget")
 
 
 def check_admission_accounts_for_prefix(snapshot_path, engine, device):
