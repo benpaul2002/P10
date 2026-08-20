@@ -28,6 +28,31 @@ class Request:
         return (self.output_ids[-1] == eos_token_id or len(self.output_ids) >= self.max_new_tokens)
 
 @dataclass
+class SchedulerStats:
+    admitted: int = 0
+    retired: int = 0
+    preempted: int = 0
+    decode_steps: int = 0
+    tokens_decoded: int = 0
+    prefill_tokens: int = 0
+    prefill_tokens_cached: int = 0
+
+    @property
+    def mean_batch_size(self):
+        return self.tokens_decoded / self.decode_steps if self.decode_steps else 0.0
+
+    def report(self):
+        pct = (100.0 * self.prefill_tokens_cached / self.prefill_tokens) if self.prefill_tokens else 0.0
+        return (
+            f"admitted             {self.admitted} ({self.preempted} readmissions after preemption)\n"
+            f"retired              {self.retired}\n"
+            f"decode steps         {self.decode_steps}\n"
+            f"tokens decoded       {self.tokens_decoded}\n"
+            f"mean batch size      {self.mean_batch_size:.2f}\n"
+            f"prefill tokens       {self.prefill_tokens} ({self.prefill_tokens_cached} served from cache, {pct:.1f}%)"
+        )
+
+@dataclass
 class Scheduler:
     kvcache: KVCache
     config: ModelConfig
@@ -37,6 +62,7 @@ class Scheduler:
     waiting_queue: list[Request] = field(default_factory=list)
     running: list[Request] = field(default_factory=list)
     finished: list[Request] = field(default_factory=list)
+    stats: SchedulerStats = field(default_factory=SchedulerStats)
 
     def can_admit(self, request):
         total = ceil(len(request.seq.token_ids) / self.kvcache.block_size)
@@ -64,6 +90,7 @@ class Scheduler:
         req.seq.length = 0
         req.state = RequestState.DONE
         self.finished.append(req)
+        self.stats.retired += 1
 
     def preempt(self, req):
         for block_id in req.seq.block_table:
@@ -73,6 +100,7 @@ class Scheduler:
         req.state = RequestState.WAITING
         self.running.remove(req)
         self.waiting_queue.insert(0, req)
+        self.stats.preempted += 1
 
     def schedule(self):
         for req in self.running:
@@ -84,7 +112,12 @@ class Scheduler:
             req.seq.token_ids = req.prompt_ids + req.output_ids[:-1]
             if self.can_admit(req):
                 self.waiting_queue.remove(req)
-                num_matched_blocks = self.kvcache.match_prefix(req.seq)
+                self.kvcache.match_prefix(req.seq)
+                # After match_prefix, seq.length is exactly the prefix served
+                # from cache; the rest is what this prefill actually computes.
+                self.stats.admitted += 1
+                self.stats.prefill_tokens += len(req.seq.token_ids)
+                self.stats.prefill_tokens_cached += req.seq.length
                 logits = prefill(torch.tensor([req.seq.token_ids[req.seq.length:]], device=self.cos.device), self.weights, self.config, self.cos, self.sin, self.kvcache, [req.seq])
                 self.kvcache.register(req.seq)
                 token = int(sample(logits, torch.tensor([[req.temperature]], dtype=torch.float32, device=self.cos.device), torch.tensor([[req.top_p]], dtype=torch.float32, device=self.cos.device)))
@@ -108,6 +141,8 @@ class Scheduler:
             # out = decode(token_ids, self.weights, self.config, self.cos, self.sin, self.kvcache, seq_list).argmax(-1).tolist()
             temperatures = torch.tensor([[req.temperature] for req in self.running], dtype=torch.float32, device=self.cos.device)
             top_ps = torch.tensor([[req.top_p] for req in self.running], dtype=torch.float32, device=self.cos.device)
+            self.stats.decode_steps += 1
+            self.stats.tokens_decoded += len(self.running)
             out = decode(token_ids, self.weights, self.config, self.cos, self.sin, self.kvcache, seq_list)
             sampled = sample(out, temperatures, top_ps).tolist()
             for req, token in zip(self.running, sampled):

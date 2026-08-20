@@ -3,6 +3,42 @@ import torch
 from math import ceil
 
 @dataclass
+class DecodePlan:
+    gather_block_ids: list[torch.Tensor]
+    gather_offsets: list[torch.Tensor]
+    scatter_block_ids: list[int]
+    scatter_offsets: list[int]
+    mask: torch.Tensor
+    max_len: int
+    lengths: list[int]
+
+@dataclass
+class CacheStats:
+    """Counters for the block pool.
+
+    blocks_matched counts every block a prefix lookup reused; blocks_revived is
+    the subset of those that had refcount 0 and had to be pulled back off the
+    free list. The difference is the sharing that was already live.
+    """
+    blocks_allocated: int = 0
+    blocks_matched: int = 0
+    blocks_revived: int = 0
+    blocks_freed: int = 0
+    registry_evictions: int = 0
+    peak_blocks_in_use: int = 0
+
+    def report(self, block_size):
+        saved = self.blocks_matched * block_size
+        return (
+            f"blocks allocated     {self.blocks_allocated}\n"
+            f"blocks matched       {self.blocks_matched} ({saved} tokens of prefill skipped)\n"
+            f"  of which revived   {self.blocks_revived}\n"
+            f"blocks freed         {self.blocks_freed}\n"
+            f"registry evictions   {self.registry_evictions}\n"
+            f"peak blocks in use   {self.peak_blocks_in_use}"
+        )
+
+@dataclass
 class KVCache:
     k: list[torch.Tensor] = field(default_factory=list)
     v: list[torch.Tensor] = field(default_factory=list)
@@ -12,6 +48,7 @@ class KVCache:
     block_hashes: list[int | None] = field(default_factory=list)
     block_size: int = 16
     num_blocks: int = 128
+    stats: CacheStats = field(default_factory=CacheStats)
 
     @classmethod
     def preallocate(cls, config, device):
@@ -32,7 +69,10 @@ class KVCache:
         if h is not None:
             del self.registry[h]
             self.block_hashes[block_id] = None
+            self.stats.registry_evictions += 1
         self.refcounts[block_id] += 1
+        self.stats.blocks_allocated += 1
+        self._note_usage()
         return block_id
 
     def free(self, block_id):
@@ -41,6 +81,7 @@ class KVCache:
         self.refcounts[block_id] -= 1
         if self.refcounts[block_id] == 0:
             self.free_blocks.append(block_id)
+            self.stats.blocks_freed += 1
 
     def truncate(self, seq, new_length):
         keep = ceil(new_length / self.block_size)
@@ -56,9 +97,25 @@ class KVCache:
         seq.prefix_hash = h
 
     def incref(self, block_id):
-        if block_id in self.free_blocks:
+        # Only reachable from match_prefix, so every call here is one block of
+        # prefix reuse. A block sitting at refcount 0 is on the free list and is
+        # being pulled back out -- that is a revival, and it consumes pool
+        # capacity that admission had to account for.
+        if self.refcounts[block_id] == 0:
             self.free_blocks.remove(block_id)
+            self.stats.blocks_revived += 1
+        self.stats.blocks_matched += 1
         self.refcounts[block_id] += 1
+        self._note_usage()
+
+    def _note_usage(self):
+        # Derived from the counters rather than the free list, because the pool
+        # is not always handed a full free list (tests constrain it), and
+        # num_blocks would then overstate what was ever available.
+        s = self.stats
+        in_use = s.blocks_allocated + s.blocks_revived - s.blocks_freed
+        if in_use > s.peak_blocks_in_use:
+            s.peak_blocks_in_use = in_use
 
     def block_hash(self, token_ids, prev_hash):
         return hash((prev_hash, tuple(token_ids)))
@@ -128,6 +185,25 @@ class KVCache:
         block_ids = table[logical]
         return block_ids, offsets
 
+    def plan_decode(self, seq_list, device):
+        gather_block_ids = []
+        gather_offsets = []
+        positions = [seq.length-1 for seq in seq_list]
+        logical = [position//self.block_size for position in positions]
+        scatter_offsets = [position%self.block_size for position in positions]
+        scatter_block_ids = [seq.block_table[l] for seq, l in zip(seq_list, logical)]
+        max_len = max(seq.length for seq in seq_list)
+        for i, seq in enumerate(seq_list):
+            block_ids, offsets = self.compute_blockId_offset(seq, 0, seq.length, device)
+            gather_block_ids.append(block_ids)
+            gather_offsets.append(offsets)
+        lengths = [seq.length for seq in seq_list]
+        lengths_t = torch.tensor(lengths, device=device)
+        positions = torch.arange(max_len, device=device)
+        mask = positions[None, :] < lengths_t[:, None]
+        mask = mask[:, None, None, :]
+        return DecodePlan(gather_block_ids, gather_offsets, scatter_block_ids, scatter_offsets, mask, max_len, lengths)
+
     def scatter_prefill(self, seq, layer_idx, k_new, v_new):
         num_new_tokens = k_new.shape[2]
         device = k_new.device
@@ -137,13 +213,9 @@ class KVCache:
         self.k[layer_idx][block_ids, offsets] = k_new_reshaped
         self.v[layer_idx][block_ids, offsets] = v_new_reshaped
 
-    def scatter_decode(self, seq_list, layer_idx, k_new, v_new):
-        num_new_tokens = k_new.shape[2]
-        device = k_new.device
-        positions = [seq.length-1 for seq in seq_list]
-        logical = [position//self.block_size for position in positions]
-        offsets = [position%self.block_size for position in positions]
-        block_ids = [seq.block_table[l] for seq, l in zip(seq_list, logical)]
+    def scatter_decode(self, plan, layer_idx, k_new, v_new):
+        block_ids = plan.scatter_block_ids
+        offsets = plan.scatter_offsets
         k_new_reshaped = k_new.squeeze(2)
         v_new_reshaped = v_new.squeeze(2)
         self.k[layer_idx][block_ids, offsets] = k_new_reshaped
@@ -158,20 +230,18 @@ class KVCache:
         v = v.transpose(0, 1).unsqueeze(0)
         return k, v
 
-    def gather_decode(self, seq_list, layer_idx):
+    def gather_decode(self, plan, layer_idx):
         device = self.k[layer_idx].device
         dtype = self.k[layer_idx].dtype
-        max_len = max(seq.length for seq in seq_list)
-        k_out = torch.zeros([len(seq_list), self.k[layer_idx].shape[2], max_len, self.k[layer_idx].shape[3]], dtype=dtype, device=device)
-        v_out = torch.zeros([len(seq_list), self.k[layer_idx].shape[2], max_len, self.k[layer_idx].shape[3]], dtype=dtype, device=device)
-        for i, seq in enumerate(seq_list):
-            block_ids, offsets = self.compute_blockId_offset(seq, 0, seq.length, device)
-            k_out[i, :, :seq.length] = self.k[layer_idx][block_ids, offsets].transpose(0, 1)
-            v_out[i, :, :seq.length] = self.v[layer_idx][block_ids, offsets].transpose(0, 1)
-        lengths = torch.tensor([seq.length for seq in seq_list], device=device)
-        positions = torch.arange(max_len, device=device)
-        mask = positions[None, :] < lengths[:, None]
-        mask = mask[:, None, None, :]
+        max_len = plan.max_len
+        k_out = torch.zeros([len(plan.lengths), self.k[layer_idx].shape[2], max_len, self.k[layer_idx].shape[3]], dtype=dtype, device=device)
+        v_out = torch.zeros([len(plan.lengths), self.k[layer_idx].shape[2], max_len, self.k[layer_idx].shape[3]], dtype=dtype, device=device)
+        for i in range(len(plan.lengths)):
+            block_ids = plan.gather_block_ids[i]
+            offsets = plan.gather_offsets[i]
+            k_out[i, :, :plan.lengths[i]] = self.k[layer_idx][block_ids, offsets].transpose(0, 1)
+            v_out[i, :, :plan.lengths[i]] = self.v[layer_idx][block_ids, offsets].transpose(0, 1)
+        mask = plan.mask
         return k_out, v_out, mask
 
 @dataclass
